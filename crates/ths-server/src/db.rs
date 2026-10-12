@@ -89,13 +89,6 @@ pub struct AddressFaucet {
     pub last_error: Option<String>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "server-owned payment progression (#196) uses this"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityIntent {
     pub activity: Activity,
@@ -103,13 +96,6 @@ pub struct ActivityIntent {
     pub memo: Option<String>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "server-owned payment progression (#196) uses this"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressFaucetIntent {
     pub payment: AddressFaucet,
@@ -259,13 +245,6 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "server-owned payment progression (#196) uses this"
-        )
-    )]
     pub fn unresolved_activities(&self) -> Result<Vec<ActivityIntent>> {
         let db = self.0.lock().unwrap();
         let mut query = db.prepare(&format!(
@@ -282,13 +261,6 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "server-owned payment progression (#196) uses this"
-        )
-    )]
     pub fn unresolved_address_faucets(&self) -> Result<Vec<AddressFaucetIntent>> {
         let db = self.0.lock().unwrap();
         let mut query = db.prepare(&format!(
@@ -415,6 +387,7 @@ impl Store {
         address_for_key(&db, key)?.context("address faucet claim was not stored")
     }
 
+    #[cfg(test)]
     pub fn discard_address_preparing(&self, id: &str) -> Result<()> {
         self.0.lock().unwrap().execute(
             "DELETE FROM address_faucets WHERE id=?1 AND status='preparing'",
@@ -493,13 +466,6 @@ impl Store {
         address_by_id(&db, id)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "server-owned payment progression (#196) uses this"
-        )
-    )]
     pub fn record_address_error(
         &self,
         id: &str,
@@ -535,13 +501,6 @@ impl Store {
         Ok(payment)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "server-owned payment progression (#196) uses this"
-        )
-    )]
     pub fn record_error(
         &self,
         id: &str,
@@ -557,13 +516,6 @@ impl Store {
         activity_by_id(&db, id).map_err(Into::into)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "server-owned payment progression (#196) uses this"
-        )
-    )]
     pub fn fail(&self, id: &str, error: &str) -> Result<Activity> {
         let db = self.0.lock().unwrap();
         let updated = db.execute(
@@ -577,6 +529,7 @@ impl Store {
         Ok(activity)
     }
 
+    #[cfg(test)]
     pub fn discard_preparing(&self, id: &str) -> Result<()> {
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction()?;

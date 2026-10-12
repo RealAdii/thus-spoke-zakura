@@ -892,19 +892,13 @@ impl RealWallet {
         })
     }
 
+    #[cfg(test)]
     pub async fn has_prepared(&self, activity_id: &str) -> Result<bool> {
         let activity_id = activity_id.to_owned();
         self.with_db(move |db| Ok(prepared_payment(db, &activity_id)?.is_some()))
             .await
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "server-owned payment progression (#196) repairs from this"
-        )
-    )]
     pub async fn prepared(&self, activity_id: &str) -> Result<Option<PreparedPayment>> {
         let activity_id = activity_id.to_owned();
         self.with_db(move |db| prepared_payment(db, &activity_id))

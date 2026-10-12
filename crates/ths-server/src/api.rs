@@ -340,11 +340,27 @@ const PAYMENT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn payment_confirmation_loop(state: AppState) {
     let mut cursor = None;
+    let mut activity_cursor = None;
+    let mut address_cursor = None;
     let mut interval = tokio::time::interval(PAYMENT_RETRY_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
         let deadline = Instant::now() + PAYMENT_DISPATCH_BUDGET;
+        if state.started()
+            && let Err(error) = progress_payment_intents(
+                &state,
+                deadline,
+                &mut activity_cursor,
+                &mut address_cursor,
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                "background payment progression failed"
+            );
+        }
         let rpc = &state.0.rpc;
         match reconcile_unconfirmed_with(&state.0.store, &mut cursor, deadline, |txid| async move {
             rpc.lookup_transaction(&txid).await
@@ -359,6 +375,330 @@ pub async fn payment_confirmation_loop(state: AppState) {
             ),
         }
     }
+}
+
+async fn progress_payment_intents(
+    state: &AppState,
+    deadline: Instant,
+    activity_cursor: &mut Option<String>,
+    address_cursor: &mut Option<String>,
+) -> anyhow::Result<()> {
+    let mut activities = state.0.store.unresolved_activities()?;
+    activities.sort_by(|left, right| left.activity.id.cmp(&right.activity.id));
+    if activities.is_empty() {
+        *activity_cursor = None;
+    }
+    let activity_start = activity_cursor.as_ref().map_or(0, |id| {
+        activities.partition_point(|intent| intent.activity.id.as_str() <= id.as_str())
+            % activities.len().max(1)
+    });
+    for offset in 0..activities.len() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let intent = &activities[(activity_start + offset) % activities.len()];
+        let _payment = state.0.payments.lock().await;
+        if Instant::now() >= deadline {
+            break;
+        }
+        *activity_cursor = Some(intent.activity.id.clone());
+        let Some(activity) = state.0.store.activity_for_key(&intent.key)? else {
+            continue;
+        };
+        if matches!(activity.status.as_str(), "confirmed" | "failed") {
+            continue;
+        }
+        if let Err(error) = progress_activity(state, intent, activity.clone()).await {
+            state.0.store.record_error(
+                &activity.id,
+                &activity.status,
+                &activity.txid,
+                &error.to_string(),
+            )?;
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                activity = %activity.id,
+                "accepted payment remains pending"
+            );
+        }
+    }
+
+    let mut address_faucets = state.0.store.unresolved_address_faucets()?;
+    address_faucets.sort_by(|left, right| left.payment.id.cmp(&right.payment.id));
+    if address_faucets.is_empty() {
+        *address_cursor = None;
+    }
+    let address_start = address_cursor.as_ref().map_or(0, |id| {
+        address_faucets.partition_point(|intent| intent.payment.id.as_str() <= id.as_str())
+            % address_faucets.len().max(1)
+    });
+    for offset in 0..address_faucets.len() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let intent = &address_faucets[(address_start + offset) % address_faucets.len()];
+        let _payment = state.0.payments.lock().await;
+        if Instant::now() >= deadline {
+            break;
+        }
+        *address_cursor = Some(intent.payment.id.clone());
+        let Some(payment) = state.0.store.address_faucet_for_key(&intent.key)? else {
+            continue;
+        };
+        if matches!(payment.status.as_str(), "confirmed" | "failed") {
+            continue;
+        }
+        let result = progress_address_faucet(state, payment.clone()).await;
+        if let Err(error) = result {
+            state.0.store.record_address_error(
+                &payment.id,
+                &payment.status,
+                &payment.txid,
+                &error.to_string(),
+            )?;
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                payment = %payment.id,
+                "accepted address faucet remains pending"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn progress_activity(
+    state: &AppState,
+    intent: &crate::db::ActivityIntent,
+    mut activity: Activity,
+) -> anyhow::Result<()> {
+    loop {
+        match activity.status.as_str() {
+            "confirmed" | "failed" => return Ok(()),
+            "prepared" | "broadcast" => {
+                match submit_prepared(&state.0.store, state, &activity).await? {
+                    PreparedSubmission::Broadcast(updated) => {
+                        let _ = confirm_after_mining(state, updated).await?;
+                        return Ok(());
+                    }
+                    PreparedSubmission::Expired(updated) => activity = updated,
+                }
+            }
+            "preparing" => {
+                if let Some(prepared) = repair_activity_journal(state, &activity).await? {
+                    activity = state.0.store.record_prepared(
+                        &activity.id,
+                        &prepared.txid,
+                        &prepared.raw_transaction,
+                        prepared.expiry_height,
+                    )?;
+                    continue;
+                }
+                let prepared = match prepare_activity_intent(state, intent).await {
+                    Ok(prepared) => prepared,
+                    Err(error) if is_insufficient_funds(&error) && activity.kind == "send" => {
+                        if can_fail_insufficient_send(state, &activity.id).await {
+                            state.0.store.fail(&activity.id, &error.to_string())?;
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                activity = state.0.store.record_prepared(
+                    &activity.id,
+                    &prepared.txid,
+                    &prepared.raw_transaction,
+                    prepared.expiry_height,
+                )?;
+            }
+            status => anyhow::bail!("payment has unsupported status {status}"),
+        }
+    }
+}
+
+fn is_insufficient_funds(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<PaymentError>(),
+        Some(PaymentError::InsufficientFunds { .. })
+    )
+}
+
+async fn can_fail_insufficient_send(state: &AppState, activity_id: &str) -> bool {
+    let wallet_prepared = match state.0.wallet.prepared(activity_id).await {
+        Ok(prepared) => prepared,
+        Err(_) => return false,
+    };
+    let store_has_transaction = state.0.store.prepared_transaction(activity_id).is_ok();
+    match wallet_prepared {
+        None => !store_has_transaction,
+        Some(prepared) if prepared.expiry_height != 0 => {
+            let current_height = match state.0.rpc.chain_info().await {
+                Ok(info) => info.blocks,
+                Err(_) => return false,
+            };
+            if current_height < prepared.expiry_height {
+                return false;
+            }
+            matches!(
+                state.0.rpc.transaction_known(&prepared.txid).await,
+                Ok(false)
+            )
+        }
+        Some(_) => false,
+    }
+}
+
+async fn repair_activity_journal(
+    state: &AppState,
+    activity: &Activity,
+) -> anyhow::Result<Option<PreparedPayment>> {
+    let Some(prepared) = state.0.wallet.prepared(&activity.id).await? else {
+        return Ok(None);
+    };
+    if prepared.expiry_height == 0
+        || state.0.rpc.chain_info().await?.blocks < prepared.expiry_height
+    {
+        return Ok(Some(prepared));
+    }
+    Ok(None)
+}
+
+async fn prepare_activity_intent(
+    state: &AppState,
+    intent: &crate::db::ActivityIntent,
+) -> anyhow::Result<PreparedPayment> {
+    let activity = &intent.activity;
+    state.synchronize_latest().await?;
+    let seed = state.0.store.seed()?;
+    let record = record_prepared_payment(&state.0.store, &activity.id);
+    match activity.kind.as_str() {
+        "send" => {
+            let account_id = activity
+                .from_account
+                .context("send omitted source account")?;
+            let destination = if let Some(address) = &activity.to_address {
+                address.clone()
+            } else {
+                let account = state
+                    .0
+                    .store
+                    .account(activity.to_account.context("send omitted destination")?)?;
+                match activity.destination_pool.as_str() {
+                    "transparent" => account.transparent_address,
+                    "ironwood" => account.unified_address,
+                    pool => anyhow::bail!("send has unsupported destination pool {pool}"),
+                }
+            };
+            let memo = parse_memo(intent.memo.as_deref(), &activity.destination_pool)
+                .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+            state
+                .0
+                .wallet
+                .prepare(
+                    Some(&activity.id),
+                    &seed,
+                    account_id,
+                    &activity.source_pool,
+                    &destination,
+                    activity.amount_zatoshi,
+                    memo,
+                    record,
+                )
+                .await
+        }
+        "faucet" => {
+            let account = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+            let destination = state.0.store.account(
+                activity
+                    .to_account
+                    .context("faucet omitted destination account")?,
+            )?;
+            let address = match activity.destination_pool.as_str() {
+                "transparent" => destination.transparent_address,
+                "ironwood" => destination.unified_address,
+                pool => anyhow::bail!("faucet has unsupported destination pool {pool}"),
+            };
+            let _replenishment = state.0.treasury_replenishment.lock().await;
+            prepare_with_replenishment(
+                state,
+                Some(&activity.id),
+                &seed,
+                &account,
+                &address,
+                activity.amount_zatoshi,
+                record,
+            )
+            .await
+        }
+        kind => anyhow::bail!("unsupported accepted payment kind {kind}"),
+    }
+}
+
+async fn progress_address_faucet(
+    state: &AppState,
+    mut payment: AddressFaucet,
+) -> anyhow::Result<()> {
+    loop {
+        match payment.status.as_str() {
+            "confirmed" | "failed" => return Ok(()),
+            "prepared" | "broadcast" => {
+                match submit_address_prepared(&state.0.store, state, &payment).await? {
+                    AddressSubmission::Broadcast(updated) => {
+                        let _ = confirm_address_after_mining(state, updated).await?;
+                        return Ok(());
+                    }
+                    AddressSubmission::Expired(updated) => payment = updated,
+                }
+            }
+            "preparing" => {
+                if let Some(prepared) = repair_address_journal(state, &payment).await? {
+                    payment = state.0.store.record_address_prepared(
+                        &payment.id,
+                        &prepared.txid,
+                        &prepared.raw_transaction,
+                        prepared.expiry_height,
+                    )?;
+                    continue;
+                }
+                state.synchronize_latest().await?;
+                let seed = state.0.store.seed()?;
+                let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+                let _replenishment = state.0.treasury_replenishment.lock().await;
+                let prepared = prepare_with_replenishment(
+                    state,
+                    Some(&payment.id),
+                    &seed,
+                    &treasury,
+                    &payment.address,
+                    payment.amount_zatoshi,
+                    record_prepared_address_payment(&state.0.store, &payment.id),
+                )
+                .await?;
+                payment = state.0.store.record_address_prepared(
+                    &payment.id,
+                    &prepared.txid,
+                    &prepared.raw_transaction,
+                    prepared.expiry_height,
+                )?;
+            }
+            status => anyhow::bail!("address faucet has unsupported status {status}"),
+        }
+    }
+}
+
+async fn repair_address_journal(
+    state: &AppState,
+    payment: &AddressFaucet,
+) -> anyhow::Result<Option<PreparedPayment>> {
+    let Some(prepared) = state.0.wallet.prepared(&payment.id).await? else {
+        return Ok(None);
+    };
+    if prepared.expiry_height == 0
+        || state.0.rpc.chain_info().await?.blocks < prepared.expiry_height
+    {
+        return Ok(Some(prepared));
+    }
+    Ok(None)
 }
 
 /// Serves the dashboard shell for client-side routes only.
@@ -996,7 +1336,7 @@ async fn fund_address_from_treasury(
             .claim_address_faucet(address, amount_zatoshi, idempotency_key)?;
     loop {
         match pending.status.as_str() {
-            "confirmed" => return Ok(pending),
+            "confirmed" | "failed" => return Ok(pending),
             "prepared" | "broadcast" => {
                 match submit_address_prepared(&state.0.store, state, &pending).await? {
                     AddressSubmission::Broadcast(payment) => {
@@ -1027,9 +1367,12 @@ async fn fund_address_from_treasury(
                 let prepared = match prepared {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        if !state.0.wallet.has_prepared(&pending.id).await? {
-                            state.0.store.discard_address_preparing(&pending.id)?;
-                        }
+                        state.0.store.record_address_error(
+                            &pending.id,
+                            "preparing",
+                            "",
+                            &error.to_string(),
+                        )?;
                         return Err(error);
                     }
                 };
@@ -1136,7 +1479,7 @@ async fn fund_from_treasury(
 #[async_trait::async_trait]
 trait PaymentLifecycle: Sync {
     async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission>;
-    async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()>;
+    fn record_preparation_error(&self, id: &str, error: &str) -> anyhow::Result<()>;
     fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity>;
     async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity>;
 }
@@ -1147,8 +1490,9 @@ impl PaymentLifecycle for AppState {
         submit_prepared(&self.0.store, self, activity).await
     }
 
-    async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()> {
-        discard_unprepared_claim(self, id).await
+    fn record_preparation_error(&self, id: &str, error: &str) -> anyhow::Result<()> {
+        self.0.store.record_error(id, "preparing", "", error)?;
+        Ok(())
     }
 
     fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity> {
@@ -1177,7 +1521,7 @@ where
 {
     loop {
         match pending.status.as_str() {
-            "confirmed" => return Ok(pending),
+            "confirmed" | "failed" => return Ok(pending),
             "prepared" | "broadcast" => match runtime.submit_prepared(&pending).await? {
                 PreparedSubmission::Broadcast(activity) => {
                     return runtime.confirm_after_mining(activity).await;
@@ -1188,7 +1532,7 @@ where
                 let prepared = match prepare(pending.id.clone()).await {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        runtime.discard_unprepared_claim(&pending.id).await?;
+                        runtime.record_preparation_error(&pending.id, &error.to_string())?;
                         return Err(error);
                     }
                 };
@@ -1258,13 +1602,6 @@ fn record_prepared_address_payment(
         )?;
         Ok(prepared)
     }
-}
-
-async fn discard_unprepared_claim(state: &AppState, id: &str) -> anyhow::Result<()> {
-    if !state.0.wallet.has_prepared(id).await? {
-        state.0.store.discard_preparing(id)?;
-    }
-    Ok(())
 }
 
 async fn submit_prepared<R: PaymentSubmitter>(
@@ -3878,7 +4215,6 @@ mod tests {
     struct RecordingPaymentLifecycle {
         store: Store,
         submissions: Mutex<VecDeque<LifecycleSubmission>>,
-        discarded: Mutex<Vec<String>>,
         record_fails: AtomicBool,
         confirm: bool,
     }
@@ -3888,7 +4224,6 @@ mod tests {
             Self {
                 store,
                 submissions: Mutex::new(submissions.into_iter().collect()),
-                discarded: Mutex::new(Vec::new()),
                 record_fails: AtomicBool::new(false),
                 confirm: true,
             }
@@ -3921,9 +4256,9 @@ mod tests {
             }
         }
 
-        async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()> {
-            self.discarded.lock().unwrap().push(id.to_owned());
-            self.store.discard_preparing(id)
+        fn record_preparation_error(&self, id: &str, error: &str) -> anyhow::Result<()> {
+            self.store.record_error(id, "preparing", "", error)?;
+            Ok(())
         }
 
         fn record_prepared(
@@ -4472,6 +4807,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payment_lifecycle_returns_failed_replays_without_preparation() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = lifecycle_claim(&store, "failed-replay");
+        let failed = store
+            .fail(&claim.id, "insufficient spendable funds")
+            .unwrap();
+        let runtime = RecordingPaymentLifecycle::new(store, []);
+        let result = execute_payment(&runtime, failed.clone(), |_| async {
+            panic!("failed replay must not prepare another payment")
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.id, failed.id);
+        assert_eq!(result.status, "failed");
+        assert_eq!(
+            result.last_error.as_deref(),
+            Some("insufficient spendable funds")
+        );
+    }
+
+    #[tokio::test]
     async fn payment_lifecycle_submits_prepared_replays_without_preparation() {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
@@ -4540,7 +4898,6 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(runtime.discarded.lock().unwrap().is_empty());
         assert_eq!(
             store
                 .activity_for_key("recording-failure")
@@ -4611,7 +4968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_preparation_discards_a_claim_without_a_wallet_journal() {
+    async fn failed_preparation_preserves_the_claim_and_records_the_error() {
         let (state, _dir) = state_with_local_wallet();
         let claim = state
             .0
@@ -4628,13 +4985,16 @@ mod tests {
             .unwrap();
 
         assert!(
-            execute_payment(&state, claim, |_| {
+            execute_payment(&state, claim.clone(), |_| {
                 std::future::ready(Err(anyhow::anyhow!("preparation failed")))
             })
             .await
             .is_err()
         );
-        assert!(state.0.store.activity_for_key("same").unwrap().is_none());
+        let retained = state.0.store.activity_for_key("same").unwrap().unwrap();
+        assert_eq!(retained.id, claim.id);
+        assert_eq!(retained.status, "preparing");
+        assert_eq!(retained.last_error.as_deref(), Some("preparation failed"));
     }
 
     #[test]
@@ -5413,7 +5773,17 @@ mod tests {
         fresh["idempotency_key"] = json!("a-key-never-used-before");
         let (status, _) = post_send(&state, &fresh).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(activity_ids(&state), before);
+        let after = activity_ids(&state);
+        assert_eq!(after.len(), before.len() + 1);
+        assert!(before.iter().all(|id| after.contains(id)));
+        let retained = state
+            .0
+            .store
+            .activity_for_key("a-key-never-used-before")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, "preparing");
+        assert!(retained.last_error.is_some());
     }
 
     #[test]
@@ -6860,7 +7230,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_store_repairs_preparation_from_the_wallet_journal() {
-        let (state, dir) = state_with_local_wallet();
+        let (mut state, dir) = state_with_local_wallet();
         let claim = state
             .0
             .store
@@ -6882,22 +7252,54 @@ mod tests {
             )
             .unwrap();
 
-        let journaled = state.0.wallet.prepared(&claim.id).await.unwrap().unwrap();
+        let rpc = Router::new().route(
+            "/",
+            post(|Json(request): Json<Value>| async move {
+                let result = match request["method"].as_str().unwrap() {
+                    "getblockchaininfo" => json!({"chain":"regtest","blocks":100}),
+                    "getrawtransaction" => json!({
+                        "txid":"journal-txid",
+                        "confirmations":1,
+                        "blockhash":"journal-block"
+                    }),
+                    method => panic!("unexpected RPC method {method}"),
+                };
+                Json(json!({
+                    "jsonrpc":"2.0",
+                    "id":request["id"],
+                    "result":result,
+                    "error":null
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, rpc).await.unwrap() });
+        Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(endpoint);
+
+        let intent = state
+            .0
+            .store
+            .unresolved_activities()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        progress_activity(&state, &intent, claim.clone())
+            .await
+            .unwrap();
         let repaired = state
             .0
             .store
-            .record_prepared(
-                &claim.id,
-                &journaled.txid,
-                &journaled.raw_transaction,
-                journaled.expiry_height,
-            )
+            .activity_for_key("journal-repair")
+            .unwrap()
             .unwrap();
 
         assert_eq!(
             (repaired.status.as_str(), repaired.txid.as_str()),
-            ("prepared", "journal-txid")
+            ("confirmed", "journal-txid")
         );
+        assert_eq!(repaired.block_hash.as_deref(), Some("journal-block"));
         assert_eq!(
             state.0.store.prepared_transaction(&claim.id).unwrap(),
             PreparedTransaction {
