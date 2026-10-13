@@ -592,6 +592,19 @@ impl Store {
             .with_context(|| format!("prepared transaction {id} is missing"))
     }
 
+    pub fn prepared_transaction_expiry(&self, id: &str) -> Result<Option<u64>> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT expiry_height FROM prepared_payments WHERE activity_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn reset_for_retry(&self, id: &str, txid: &str) -> Result<Activity> {
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction()?;
