@@ -1896,9 +1896,13 @@ async fn exercise_recovery(
         confirmed.status == "confirmed",
         "recovered activity was not confirmed"
     );
+    // Server-owned progression may retry the failed auto-mine once while the
+    // client polls. It must not repeat the injected rejection or mine forever.
+    let recovery_counts = fixture.proxy().counts();
     anyhow::ensure!(
-        fixture.proxy().counts() == proxy_after_auto_mine,
-        "recovery polling changed proxy mining counters"
+        recovery_counts.rejected == proxy_after_auto_mine.rejected
+            && recovery_counts.forwarded <= proxy_after_auto_mine.forwarded + 1,
+        "recovery polling caused more than one auto-mine retry: {recovery_counts:?}"
     );
     let final_activities: Vec<Activity> = request_json(
         &client,
