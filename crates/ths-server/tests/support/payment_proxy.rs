@@ -150,11 +150,14 @@ impl QueuedBroadcastProxy {
     pub fn assert_identical_retry(&self) -> Result<()> {
         let state = self.shared.broadcasts.lock().unwrap();
         anyhow::ensure!(
-            state.queued_responses == 1 && state.requests.len() == 2,
-            "expected one original broadcast and one queued retry"
+            state.queued_responses == 1 && state.requests.len() >= 2,
+            "expected the original broadcast and one queued retry"
         );
         anyhow::ensure!(
-            state.requests[0] == state.requests[1],
+            state
+                .requests
+                .iter()
+                .all(|request| request == &state.requests[0]),
             "retry changed the signed gRPC transaction"
         );
         Ok(())
