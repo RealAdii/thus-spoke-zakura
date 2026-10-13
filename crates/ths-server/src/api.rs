@@ -354,7 +354,8 @@ async fn bounded_payment_chain_info_until(
     state: &AppState,
     deadline: Instant,
 ) -> anyhow::Result<ChainInfo> {
-    tokio::time::timeout_at(deadline, state.0.rpc.chain_info())
+    let lookup_deadline = deadline.min(Instant::now() + PAYMENT_LOOKUP_TIMEOUT);
+    tokio::time::timeout_at(lookup_deadline, state.0.rpc.chain_info())
         .await
         .context("payment progression chain lookup timed out")?
 }
@@ -4560,6 +4561,206 @@ mod tests {
             .record_prepared(&claim.id, key, b"signed", 140)
             .unwrap();
         store.mark_broadcast(&prepared.id, key).unwrap()
+    }
+
+    async fn journal_height_rpc(slow: Arc<AtomicBool>) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let slow = slow.clone();
+                async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "getblockchaininfo" => {
+                            if slow.load(Ordering::SeqCst) {
+                                tokio::time::sleep(PAYMENT_DISPATCH_BUDGET + Duration::from_secs(1))
+                                    .await;
+                            }
+                            json!({"chain":"regtest","blocks":100,"bestblockhash":"ab".repeat(32),"verificationprogress":1.0})
+                        }
+                        "getrawtransaction" => {
+                            let txid = request["params"][0].as_str().unwrap();
+                            assert!(matches!(txid, "journal-txid" | "fast-external-txid"));
+                            json!({"txid":txid,"confirmations":1,"blockhash":"confirmed-block"})
+                        }
+                        method => panic!("unexpected journal recovery RPC {method}"),
+                    };
+                    Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result,"error":null}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn slow_journal_height_lookup_preserves_recovery_and_external_dispatch_across_passes() {
+        let slow = Arc::new(AtomicBool::new(true));
+        let (endpoint, server) = journal_height_rpc(slow.clone()).await;
+        let (mut state, dir) = state_with_local_wallet();
+        Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(endpoint);
+        let internal = lifecycle_claim(&state.0.store, "slow-journal");
+        let wallet_db = rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap();
+        wallet_db
+            .execute(
+                "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![internal.id, "journal-txid", b"original signed bytes", 140_u64],
+            )
+            .unwrap();
+
+        let mut activity_cursor = None;
+        let mut address_cursor = None;
+        for key in ["fast-external-first-pass", "fast-external-second-pass"] {
+            let external = state
+                .0
+                .store
+                .claim_address_faucet("tm-external", 12_000, key)
+                .unwrap();
+            state
+                .0
+                .store
+                .record_address_prepared(&external.id, "fast-external-txid", b"external bytes", 0)
+                .unwrap();
+            progress_payment_intents(
+                &state,
+                Instant::now() + PAYMENT_DISPATCH_BUDGET,
+                &mut activity_cursor,
+                &mut address_cursor,
+            )
+            .await
+            .unwrap();
+
+            let progressed = state.0.store.address_faucet_for_key(key).unwrap().unwrap();
+            assert_eq!(progressed.status, "confirmed");
+            assert_eq!(progressed.txid, "fast-external-txid");
+            assert_eq!(progressed.block_hash.as_deref(), Some("confirmed-block"));
+            let pending = state
+                .0
+                .store
+                .activity_for_key("slow-journal")
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.status, "preparing");
+            assert!(pending.txid.is_empty());
+            assert!(pending.last_error.is_some());
+            assert!(
+                state
+                    .0
+                    .store
+                    .prepared_transaction_expiry(&internal.id)
+                    .unwrap()
+                    .is_none()
+            );
+            let journal = state
+                .0
+                .wallet
+                .prepared(&internal.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(journal.txid, "journal-txid");
+            assert_eq!(journal.raw_transaction, b"original signed bytes");
+            assert_eq!(journal.expiry_height, 140);
+        }
+
+        slow.store(false, Ordering::SeqCst);
+        progress_payment_intents(
+            &state,
+            Instant::now() + PAYMENT_DISPATCH_BUDGET,
+            &mut activity_cursor,
+            &mut address_cursor,
+        )
+        .await
+        .unwrap();
+        let recovered = state
+            .0
+            .store
+            .activity_for_key("slow-journal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.id, internal.id);
+        assert_eq!(recovered.status, "confirmed");
+        assert_eq!(recovered.txid, "journal-txid");
+        let saved = state.0.store.prepared_transaction(&internal.id).unwrap();
+        assert_eq!(saved.raw_transaction, b"original signed bytes");
+        assert_eq!(saved.expiry_height, 140);
+
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn journal_height_lookup_caps_both_repair_paths_without_extending_the_pass_deadline() {
+        let (endpoint, server) = journal_height_rpc(Arc::new(AtomicBool::new(true))).await;
+        let (mut state, dir) = state_with_local_wallet();
+        Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(endpoint);
+        let internal = lifecycle_claim(&state.0.store, "bounded-internal-journal");
+        let external = state
+            .0
+            .store
+            .claim_address_faucet("tm-external", 12_000, "bounded-external-journal")
+            .unwrap();
+        let wallet_db = rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap();
+        for id in [&internal.id, &external.id] {
+            wallet_db
+                .execute(
+                    "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![id, "journal-txid", b"original signed bytes", 140_u64],
+                )
+                .unwrap();
+        }
+
+        for budget in [PAYMENT_DISPATCH_BUDGET, Duration::from_millis(100)] {
+            for internal_path in [true, false] {
+                let started = Instant::now();
+                let deadline = started + budget;
+                let (id, result) = if internal_path {
+                    (
+                        &internal.id,
+                        repair_activity_journal(&state, &internal, deadline).await,
+                    )
+                } else {
+                    (
+                        &external.id,
+                        repair_address_journal(&state, &external, deadline).await,
+                    )
+                };
+                let error = result.err().unwrap();
+                assert!(
+                    error
+                        .downcast_ref::<tokio::time::error::Elapsed>()
+                        .is_some()
+                );
+                assert!(
+                    started.elapsed() < budget.min(PAYMENT_LOOKUP_TIMEOUT) + Duration::from_secs(1)
+                );
+                let journal = state.0.wallet.prepared(id).await.unwrap().unwrap();
+                assert_eq!(journal.txid, "journal-txid");
+                assert_eq!(journal.raw_transaction, b"original signed bytes");
+                assert_eq!(journal.expiry_height, 140);
+            }
+        }
+
+        wallet_db
+            .execute("UPDATE ext_tsz_prepared_payments SET expiry_height=0", [])
+            .unwrap();
+        let internal_journal = repair_activity_journal(&state, &internal, Instant::now())
+            .await
+            .unwrap()
+            .unwrap();
+        let external_journal = repair_address_journal(&state, &external, Instant::now())
+            .await
+            .unwrap()
+            .unwrap();
+        for journal in [internal_journal, external_journal] {
+            assert_eq!(journal.txid, "journal-txid");
+            assert_eq!(journal.raw_transaction, b"original signed bytes");
+            assert_eq!(journal.expiry_height, 0);
+        }
+
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
